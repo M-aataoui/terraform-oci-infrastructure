@@ -1,0 +1,18 @@
+# Fichiers d'état local Terraform
+*.tfstate
+*.tfstate.*
+crash.log
+crash.*.log
+
+# Fichiers de variables sensibles
+*.tfvars
+*.tfvars.json
+
+# Configuration locale & plugins
+.terraform/
+.terraform.lock.hcl
+
+# Clés SSH & Certificats
+*.key
+*.key.pub
+*.pem
