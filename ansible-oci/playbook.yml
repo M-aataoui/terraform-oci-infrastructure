@@ -1,0 +1,143 @@
+---
+- name: Hardening VM OCI & Deployment Kubernetes (k3s)
+  hosts: k8s_server
+  become: true
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+
+  tasks:
+    # -------------------------------------------------------------------------
+    # 1. MISE À JOUR ET DÉPENDANCES
+    # -------------------------------------------------------------------------
+    - name: Mettre à jour le cache APT et les paquets
+      apt:
+        update_cache: yes
+        upgrade: dist
+
+    - name: Installer les outils de sécurité et dépendances K8s
+      apt:
+        name:
+          - ufw
+          - fail2ban
+          - lynis
+          - curl
+          - iptables
+        state: present
+
+    # -------------------------------------------------------------------------
+    # 2. CONFIGURATION SYSCTL & MODULES NOYAU (LYNIS + K3S)
+    # -------------------------------------------------------------------------
+    - name: Charger les modules noyau nécessaires pour Kubernetes (k3s)
+      copy:
+        dest: /etc/modules-load.d/k3s.conf
+        content: |
+          overlay
+          br_netfilter
+
+    - name: Charger immédiatement les modules noyau
+      modprobe:
+        name: "{{ item }}"
+        state: present
+      loop:
+        - overlay
+        - br_netfilter
+
+    - name: Appliquer les règles de Hardening Sysctl (Lynis & K8s compat)
+      sysctl:
+        name: "{{ item.key }}"
+        value: "{{ item.value }}"
+        state: present
+        reload: yes
+      loop:
+        - { key: 'net.ipv4.ip_forward', value: '1' }
+        - { key: 'net.bridge.bridge-nf-call-iptables', value: '1' }
+        - { key: 'net.bridge.bridge-nf-call-ip6tables', value: '1' }
+        - { key: 'net.ipv4.conf.all.accept_redirects', value: '0' }
+        - { key: 'net.ipv4.conf.default.accept_redirects', value: '0' }
+        - { key: 'net.ipv4.conf.all.send_redirects', value: '0' }
+        - { key: 'net.ipv4.conf.all.rp_filter', value: '1' }
+        - { key: 'net.ipv4.conf.default.rp_filter', value: '1' }
+        - { key: 'net.ipv4.tcp_syncookies', value: '1' }
+        - { key: 'fs.protected_hardlinks', value: '1' }
+        - { key: 'fs.protected_symlinks', value: '1' }
+        - { key: 'fs.inotify.max_user_watches', value: '524288' }
+        - { key: 'fs.inotify.max_user_instances', value: '512' }
+
+    # -------------------------------------------------------------------------
+    # 3. HARDENING SSHD
+    # -------------------------------------------------------------------------
+    - name: Sécuriser le service SSHD
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: "{{ item.regexp }}"
+        line: "{{ item.line }}"
+        state: present
+      loop:
+        - { regexp: '^#?PermitRootLogin', line: 'PermitRootLogin no' }
+        - { regexp: '^#?PasswordAuthentication', line: 'PasswordAuthentication no' }
+        - { regexp: '^#?X11Forwarding', line: 'X11Forwarding no' }
+        - { regexp: '^#?MaxAuthTries', line: 'MaxAuthTries 3' }
+        - { regexp: '^#?ClientAliveInterval', line: 'ClientAliveInterval 300' }
+        - { regexp: '^#?ClientAliveCountMax', line: 'ClientAliveCountMax 2' }
+      notify: Restart SSHD
+
+    # -------------------------------------------------------------------------
+    # 4. PARE-FEU UFW
+    # -------------------------------------------------------------------------
+    - name: Configurer UFW - Politique par défaut (Deny Incoming)
+      community.general.ufw:
+        direction: "{{ item.direction }}"
+        policy: "{{ item.policy }}"
+      loop:
+        - { direction: 'incoming', policy: 'deny' }
+        - { direction: 'outgoing', policy: 'allow' }
+
+    - name: Autoriser SSH, HTTP (80) et HTTPS (443) pour l'application
+      community.general.ufw:
+        rule: allow
+        port: "{{ item }}"
+        proto: tcp
+      loop:
+        - '22'    # SSH
+        - '80'    # HTTP (Inbound App)
+        - '443'   # HTTPS (Inbound App)
+        - '6443'  # API Server Kubernetes (K3s)
+
+    - name: Autoriser le trafic réseau interne K3s / Pods (Flannel CNI)
+      community.general.ufw:
+        rule: allow
+        interface: "{{ item }}"
+        direction: in
+      loop:
+        - cni0
+        - flannel.1
+        - lo
+
+    - name: Activer UFW
+      community.general.ufw:
+        state: enabled
+
+    # -------------------------------------------------------------------------
+    # 5. INSTALLATION K3S
+    # -------------------------------------------------------------------------
+    - name: Vérifier si K3s est déjà installé
+      command: k3s --version
+      register: k3s_check
+      ignore_errors: true
+      changed_when: false
+
+    - name: Télécharger et installer K3s
+      shell: "curl -sfL https://get.k3s.io | sh -s - --write-kubeconfig-mode 644"
+      when: k3s_check.rc != 0
+
+    - name: S'assurer que le service K3s est démarré et activé
+      systemd:
+        name: k3s
+        state: started
+        enabled: yes
+
+  handlers:
+    - name: Restart SSHD
+      service:
+        name: sshd
+        state: restarted
